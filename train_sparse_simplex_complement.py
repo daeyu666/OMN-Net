@@ -72,6 +72,7 @@ def parse_specific_args():
     p.add_argument("--stage3_patch_size", type=int, default=128)
     p.add_argument("--stage3_stride", type=int, default=64)
     p.add_argument("--stage3_batch_size", type=int, default=1)
+    p.add_argument("--stage3_train_query_pixels", type=int, default=512)
     p.add_argument("--nonlocal_top_k", type=int, default=690)
     p.add_argument("--nonlocal_exclusion_radius_lr", type=int, default=1)
     p.add_argument("--nonlocal_query_chunk_pixels", type=int, default=64)
@@ -93,14 +94,13 @@ def parse_specific_args():
     if not _has_option(remaining, "--srf_band_set"):
         cfg.srf_band_set = "wv2_visible6"
 
-    # Stage3 must expose at least K=690 LR states. With scale=4, a 128x128 HR
-    # patch yields a 32x32 LR-HSI memory containing 1024 observed states.
     cfg.patch_size = cfg.stage3_patch_size
     cfg.stride = cfg.stage3_stride
     cfg.batch_size = cfg.stage3_batch_size
     return cfg
 
 
+@torch.no_grad()
 def build_complement_target(
     model: SparseSimplexComplementNet,
     out: Dict[str, torch.Tensor],
@@ -126,20 +126,44 @@ def build_complement_target(
     return unflatten_spatial(target_flat, gt.size(2), gt.size(3))
 
 
-def compute_loss(
+def sample_query_indices(
+    batch_size: int,
+    query_count: int,
+    sample_count: int,
+    device: torch.device,
+) -> torch.Tensor:
+    count = min(max(int(sample_count), 1), query_count)
+    return torch.stack(
+        [
+            torch.randperm(query_count, device=device)[:count]
+            for _ in range(batch_size)
+        ],
+        dim=0,
+    )
+
+
+def compute_sampled_loss(
     model: SparseSimplexComplementNet,
     out: Dict[str, torch.Tensor],
     gt: torch.Tensor,
+    query_indices: torch.Tensor,
     beta: float,
 ):
     target = build_complement_target(model, out, gt)
-    scale = out["coefficient_scale"].view(1, -1, 1, 1)
+    target_flat = flatten_spatial(target)
+    rank = target_flat.size(2)
+    selected_target = torch.gather(
+        target_flat,
+        1,
+        query_indices.unsqueeze(-1).expand(-1, -1, rank),
+    )
+    scale = out["coefficient_scale"].view(1, 1, -1)
     loss = F.smooth_l1_loss(
-        out["complement_residual"] / scale,
-        target / scale,
+        out["complement_residual_flat"] / scale,
+        selected_target / scale,
         beta=beta,
     )
-    return loss, target
+    return loss
 
 
 def train_epoch(model, loader, optimizer, cfg, device):
@@ -150,10 +174,27 @@ def train_epoch(model, loader, optimizer, cfg, device):
     }
     for batch in loader:
         batch = move_to_device(batch, device)
+        batch_size = batch["gt"].size(0)
+        query_count = batch["gt"].size(2) * batch["gt"].size(3)
+        query_indices = sample_query_indices(
+            batch_size,
+            query_count,
+            cfg.stage3_train_query_pixels,
+            device,
+        )
+
         optimizer.zero_grad(set_to_none=True)
-        out = model(batch["lr_hsi"], batch["hr_msi"])
-        loss, _ = compute_loss(
-            model, out, batch["gt"], cfg.stage3_loss_beta
+        out = model(
+            batch["lr_hsi"],
+            batch["hr_msi"],
+            query_indices=query_indices,
+        )
+        loss = compute_sampled_loss(
+            model,
+            out,
+            batch["gt"],
+            query_indices,
+            cfg.stage3_loss_beta,
         )
         loss.backward()
         if cfg.stage3_grad_clip > 0:
@@ -161,13 +202,17 @@ def train_epoch(model, loader, optimizer, cfg, device):
                 model.trainable_parameters(), cfg.stage3_grad_clip
             )
         optimizer.step()
-        n = batch["lr_hsi"].size(0)
-        meters["loss"].update(loss.detach().item(), n)
+
+        meters["loss"].update(loss.detach().item(), batch_size)
         meters["active"].update(
-            out["active_candidates_mean"].item(), n
+            out["active_candidates_mean"].item(), batch_size
         )
-        meters["max_weight"].update(out["max_weight_mean"].item(), n)
-        meters["probe_norm"].update(out["probe_norm_mean"].item(), n)
+        meters["max_weight"].update(
+            out["max_weight_mean"].item(), batch_size
+        )
+        meters["probe_norm"].update(
+            out["probe_norm_mean"].item(), batch_size
+        )
     return {key: meter.avg for key, meter in meters.items()}
 
 
@@ -272,6 +317,8 @@ def main():
     device = get_device(cfg.device)
     train_loader, test_loader, info = build_loaders(cfg)
 
+    if cfg.stage3_patch_size % cfg.scale_ratio != 0:
+        raise ValueError("stage3_patch_size must be divisible by scale_ratio")
     lr_memory_h = cfg.stage3_patch_size // cfg.scale_ratio
     lr_memory_count = lr_memory_h * lr_memory_h
     max_excluded = (2 * cfg.nonlocal_exclusion_radius_lr + 1) ** 2
@@ -282,9 +329,10 @@ def main():
         )
 
     model, local_epoch, local_best = build_model(cfg, info, device)
-    trainable = model.trainable_parameters()
     optimizer = torch.optim.AdamW(
-        trainable, lr=cfg.lr, weight_decay=cfg.weight_decay
+        model.trainable_parameters(),
+        lr=cfg.lr,
+        weight_decay=cfg.weight_decay,
     )
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=max(cfg.epochs, 1), eta_min=cfg.lr * 0.05
@@ -329,7 +377,8 @@ def main():
         "Sparse-simplex start | "
         f"Stage2 checkpoint epoch={local_epoch} best={local_best:.4f} | "
         f"trainable={count_parameters(model):.3f}M | "
-        f"K={cfg.nonlocal_top_k} patch={cfg.stage3_patch_size} | "
+        f"K={cfg.nonlocal_top_k} patch={cfg.stage3_patch_size} "
+        f"train_queries={cfg.stage3_train_query_pixels} | "
         f"PSNR={start['stage3_psnr']:.4f} "
         f"SAM={start['stage3_sam']:.4f} | "
         f"Stage2={start['stage2_psnr']:.4f} | "
@@ -362,6 +411,7 @@ def main():
             "local_checkpoint": cfg.local_checkpoint,
             "top_k": cfg.nonlocal_top_k,
             "stage3_patch_size": cfg.stage3_patch_size,
+            "stage3_train_query_pixels": cfg.stage3_train_query_pixels,
             "loss": "P_comp SmoothL1 only",
         },
     )
@@ -411,6 +461,7 @@ def main():
                     "local_checkpoint": cfg.local_checkpoint,
                     "top_k": cfg.nonlocal_top_k,
                     "stage3_patch_size": cfg.stage3_patch_size,
+                    "stage3_train_query_pixels": cfg.stage3_train_query_pixels,
                     "loss": "P_comp SmoothL1 only",
                 },
             )
@@ -423,6 +474,7 @@ def main():
         "local_best": float(local_best),
         "top_k": cfg.nonlocal_top_k,
         "patch_size": cfg.stage3_patch_size,
+        "train_query_pixels": cfg.stage3_train_query_pixels,
         "trainable_parameters_m": count_parameters(model),
     }
     with open(
