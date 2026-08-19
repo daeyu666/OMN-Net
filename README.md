@@ -53,6 +53,26 @@ coefficient coordinates, but only
 is allowed to affect reconstruction. This is invariant to sign flips,
 permutations, and rotations of the local SVD basis.
 
+### 4. Tangent-complement non-local spectral recurrence diagnostic
+
+Innovation point 2 is tested before any trainable Stage-3 backbone is added.
+The residual subspace is the local tangent complement inside the MSI null space,
+implemented numerically as
+
+\[
+P_{\text{comp}}(p)=P_{\text{null}}(I-T_pT_p^\top)P_{\text{null}}.
+\]
+
+The diagnostic uses an asymmetric non-local memory:
+
+- the retrieval key is the MSI-observable reduced-response state `S C`;
+- the memory value is the LR-HSI-derived null state `P_null C_lr`;
+- a retrieved remote state can affect reconstruction only after projection into
+  the query pixel's `P_comp` subspace.
+
+This lets the oracle separate three possible bottlenecks: LR-HSI memory value
+support, observable-key retrieval, and non-GT aggregation.
+
 ## Repository structure
 
 ```text
@@ -60,10 +80,12 @@ OMN-Net/
 ├── models/
 │   ├── spectral_foundation.py
 │   ├── observation_geometry.py
-│   └── local_null_manifold.py
+│   ├── local_null_manifold.py
+│   └── nonlocal_complement.py
 ├── diagnostics/
 │   ├── inspect_observability.py
-│   └── inspect_local_tangent_oracle.py
+│   ├── inspect_local_tangent_oracle.py
+│   └── inspect_nonlocal_complement_oracle.py
 ├── train_spectral_foundation.py
 ├── train_local_null_manifold.py
 ├── data_loader.py
@@ -124,6 +146,28 @@ python train_local_null_manifold.py \
   --proposal_amplitude_multiplier 8
 ```
 
+Inspect innovation point 2 after the Stage-2 checkpoint has been reproduced:
+
+```bash
+python diagnostics/inspect_nonlocal_complement_oracle.py \
+  --dataset PaviaU \
+  --foundation_checkpoint checkpoints/RAPD-Net/basis_for_stage2.pth \
+  --local_checkpoint checkpoints/local_null_manifold/PaviaU/local_null_best_psnr.pth \
+  --msi_mode srf \
+  --srf_band_set wv2_visible6 \
+  --tangent_dimension 4 \
+  --tangent_kernel_size 5 \
+  --tangent_dilation 2 \
+  --nonlocal_top_k 32 \
+  --nonlocal_exclusion_radius_lr 1
+```
+
+The diagnostic writes
+`outputs/diagnostics/nonlocal_complement/PaviaU/nonlocal_complement_oracle.json`.
+It reports the actual Stage-2 result, the GT `P_comp` ceiling, global LR-state
+hard/convex oracles, observable-key Top-K hard/convex oracles, and a fully
+non-GT soft-retrieval result.
+
 `models/observation_geometry.py::load_foundation_checkpoint` can also load a
 compatible RAPD-Net Stage-1 spectral-basis checkpoint, so the validated old
 foundation can be reused without retraining if its `.pth` file is copied into
@@ -131,12 +175,13 @@ the new project.
 
 ## Next research step
 
-The next mechanism is **not implemented yet**. It will first be tested with a
-no-training oracle for the residual subspace
+The no-training innovation-point-2 diagnostic is implemented, but a trainable
+Stage-3 complement predictor is still intentionally absent. It should be added
+only if the LR-HSI non-local state oracle shows meaningful recovery inside
+`P_comp`.
 
-\[
-P_{\text{null}}-T_pT_p^\top,
-\]
-
-before any non-local complement network or uncertainty/trust-region module is
-added.
+If global LR-state oracles are strong but observable-key Top-K oracles are weak,
+the next work is retrieval-key design. If Top-K oracles are strong but soft
+aggregation is weak, the next work is candidate weighting / residual prediction.
+If even the global LR-state oracle is weak, the non-local complement route
+should be stopped instead of being rescued by a larger backbone.
