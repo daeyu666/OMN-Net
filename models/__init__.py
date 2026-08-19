@@ -12,6 +12,14 @@ from .local_null_manifold import (
     LocalNullManifoldNet,
     build_local_tangent_field,
 )
+from .nonlocal_complement import (
+    ObservableKeyedComplementMemory,
+    flatten_spatial,
+    flatten_tangent,
+    gather_complement_candidates,
+    project_complement_vectors,
+    unflatten_spatial,
+)
 
 __all__ = [
     "SpectralFoundation",
@@ -22,4 +30,10 @@ __all__ = [
     "project_coefficients",
     "LocalNullManifoldNet",
     "build_local_tangent_field",
+    "ObservableKeyedComplementMemory",
+    "flatten_spatial",
+    "flatten_tangent",
+    "gather_complement_candidates",
+    "project_complement_vectors",
+    "unflatten_spatial",
 ]
