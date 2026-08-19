@@ -17,8 +17,7 @@ the reconstruction directly.
 """
 from __future__ import annotations
 
-import math
-from typing import Dict, Tuple
+from typing import Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -35,12 +34,7 @@ from .nonlocal_complement import (
 
 
 def sparsemax(logits: torch.Tensor, dim: int = -1) -> torch.Tensor:
-    """Sparsemax projection onto the probability simplex.
-
-    This implementation follows the closed-form Euclidean projection and uses
-    only standard PyTorch tensor operations, so autograd is available almost
-    everywhere exactly as required for training.
-    """
+    """Sparsemax projection onto the probability simplex."""
     if logits.numel() == 0:
         return logits
     z = logits - logits.max(dim=dim, keepdim=True).values
@@ -126,8 +120,6 @@ class CandidateScorer(nn.Module):
             layers.extend([nn.Linear(hidden_dim, hidden_dim), nn.GELU()])
         self.body = nn.Sequential(*layers)
         self.head = nn.Linear(hidden_dim, 1)
-        # Start from the deterministic observable-distance ordering. The learned
-        # branch initially contributes zero and is then trained by P_comp loss.
         nn.init.zeros_(self.head.weight)
         nn.init.zeros_(self.head.bias)
 
@@ -182,14 +174,9 @@ class SparseSimplexComplementNet(nn.Module):
             coefficient_rank=rank,
             blocks=context_blocks,
         )
-
-        # candidate feature = signed observable difference + normalized
-        # observable distance + normalized P_comp residual + residual magnitude
-        # + selection-only probe alignment.
         candidate_feature_dim = msi_channels + 1 + rank + 1 + 1
-        scorer_input_dim = context_channels + candidate_feature_dim
         self.candidate_scorer = CandidateScorer(
-            input_dim=scorer_input_dim,
+            input_dim=context_channels + candidate_feature_dim,
             hidden_dim=scorer_hidden,
             blocks=scorer_blocks,
         )
@@ -305,14 +292,14 @@ class SparseSimplexComplementNet(nn.Module):
         )
 
     def forward(
-        self, lr_hsi: torch.Tensor, hr_msi: torch.Tensor
+        self,
+        lr_hsi: torch.Tensor,
+        hr_msi: torch.Tensor,
+        query_indices: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         with torch.no_grad():
             stage2 = self.local_model(lr_hsi, hr_msi)
-            # Keep an explicit alias so _query_features never depends on an
-            # implicit external tensor.
             stage2["hr_msi"] = hr_msi.detach()
-
             geometry = self.local_model.geometry
             reduced_response = geometry.reduced_response.to(
                 stage2["lr_coefficients"]
@@ -340,13 +327,25 @@ class SparseSimplexComplementNet(nn.Module):
                 query_observable, memory_observable
             )
 
-        query_input = self._query_features(stage2)
-        query_context, raw_probe = self.query_encoder(query_input)
-
+        query_context, raw_probe = self.query_encoder(
+            self._query_features(stage2)
+        )
         n, _, height, width = local_null_state.shape
-        q_count = height * width
+        full_query_count = height * width
         rank = local_null_state.size(1)
         top_k = topk_indices.size(2)
+
+        if query_indices is not None:
+            if query_indices.ndim != 2 or query_indices.size(0) != n:
+                raise ValueError("query_indices must be [N,Q_sample]")
+            if query_indices.numel() == 0:
+                raise ValueError("query_indices cannot be empty")
+            if int(query_indices.min().item()) < 0 or int(query_indices.max().item()) >= full_query_count:
+                raise ValueError("query_indices are outside the HR field")
+            effective_query_count = query_indices.size(1)
+        else:
+            effective_query_count = full_query_count
+
         memory_flat = flatten_spatial(memory_null)
         local_flat = flatten_spatial(local_null_state)
         tangent_flat = flatten_tangent(stage2["tangent_basis"])
@@ -361,22 +360,36 @@ class SparseSimplexComplementNet(nn.Module):
         probe_norm_batches = []
 
         for b in range(n):
+            if query_indices is None:
+                selected = torch.arange(
+                    full_query_count, device=hr_msi.device, dtype=torch.long
+                )
+            else:
+                selected = query_indices[b]
+
+            idx_all = topk_indices[b, selected]
+            distance_all = topk_distances[b, selected]
+            query_obs_all = query_observable_std[b, selected]
+            local_all = local_flat[b, selected]
+            tangent_all = tangent_flat[b, selected]
+            context_all = context_flat[b, selected]
+            probe_all = probe_flat[b, selected]
+
             residual_chunks = []
             active_chunks = []
             max_weight_chunks = []
             probe_norm_chunks = []
             memory = memory_flat[b]
             memory_obs = memory_observable_std[b].to(local_null_state.dtype)
-            for start in range(0, q_count, self.query_chunk_pixels):
-                stop = min(start + self.query_chunk_pixels, q_count)
-                idx = topk_indices[b, start:stop]
-                distances = topk_distances[b, start:stop].to(
-                    local_null_state.dtype
-                )
-                local = local_flat[b, start:stop]
-                tangent = tangent_flat[b, start:stop]
-                context = context_flat[b, start:stop]
-                probe = probe_flat[b, start:stop]
+
+            for start in range(0, effective_query_count, self.query_chunk_pixels):
+                stop = min(start + self.query_chunk_pixels, effective_query_count)
+                idx = idx_all[start:stop]
+                distances = distance_all[start:stop].to(local_null_state.dtype)
+                local = local_all[start:stop]
+                tangent = tangent_all[start:stop]
+                context = context_all[start:stop]
+                probe = probe_all[start:stop]
 
                 candidates = gather_complement_candidates(
                     memory,
@@ -390,7 +403,7 @@ class SparseSimplexComplementNet(nn.Module):
                     dim=2, keepdim=True
                 ).sqrt()
 
-                query_obs = query_observable_std[b, start:stop].to(
+                query_obs = query_obs_all[start:stop].to(
                     local_null_state.dtype
                 )
                 candidate_obs = memory_obs[idx]
@@ -441,10 +454,9 @@ class SparseSimplexComplementNet(nn.Module):
                 weights = sparsemax(
                     logits / self.sparsemax_temperature, dim=1
                 )
-                residual = torch.sum(
-                    weights.unsqueeze(-1) * candidates, dim=1
+                residual_chunks.append(
+                    torch.sum(weights.unsqueeze(-1) * candidates, dim=1)
                 )
-                residual_chunks.append(residual)
                 active_chunks.append(
                     (weights > 1e-8).to(weights.dtype).sum(
                         dim=1, keepdim=True
@@ -463,21 +475,11 @@ class SparseSimplexComplementNet(nn.Module):
             probe_norm_batches.append(torch.cat(probe_norm_chunks, dim=0))
 
         complement_flat = torch.stack(residual_batches, dim=0)
-        complement_residual = unflatten_spatial(
-            complement_flat, height, width
-        )
-        corrected_coefficients = (
-            stage2["corrected_coefficients"] + complement_residual
-        )
-        reconstructed_hsi = self.local_model.foundation.decode(
-            corrected_coefficients, basis=stage2["basis"]
-        )
-
         active = torch.stack(active_batches, dim=0)
         max_weight = torch.stack(max_weight_batches, dim=0)
         probe_norm = torch.stack(probe_norm_batches, dim=0)
 
-        return {
+        result = {
             "basis": stage2["basis"],
             "coefficient_scale": stage2["coefficient_scale"],
             "lr_coefficients": stage2["lr_coefficients"],
@@ -487,9 +489,8 @@ class SparseSimplexComplementNet(nn.Module):
             "tangent_scale": stage2["tangent_scale"],
             "stage2_coefficients": stage2["corrected_coefficients"],
             "stage2_hsi": stage2["reconstructed_hsi"],
-            "complement_residual": complement_residual,
-            "corrected_coefficients": corrected_coefficients,
-            "reconstructed_hsi": reconstructed_hsi,
+            "complement_residual_flat": complement_flat,
+            "sampled_query_indices": query_indices,
             "active_candidates_mean": active.detach().mean(),
             "max_weight_mean": max_weight.detach().mean(),
             "probe_norm_mean": probe_norm.detach().mean(),
@@ -497,3 +498,22 @@ class SparseSimplexComplementNet(nn.Module):
                 top_k, device=hr_msi.device, dtype=torch.long
             ),
         }
+
+        if query_indices is None:
+            complement_residual = unflatten_spatial(
+                complement_flat, height, width
+            )
+            corrected_coefficients = (
+                stage2["corrected_coefficients"] + complement_residual
+            )
+            reconstructed_hsi = self.local_model.foundation.decode(
+                corrected_coefficients, basis=stage2["basis"]
+            )
+            result.update(
+                {
+                    "complement_residual": complement_residual,
+                    "corrected_coefficients": corrected_coefficients,
+                    "reconstructed_hsi": reconstructed_hsi,
+                }
+            )
+        return result
