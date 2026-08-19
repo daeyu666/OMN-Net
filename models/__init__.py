@@ -20,6 +20,10 @@ from .nonlocal_complement import (
     project_complement_vectors,
     unflatten_spatial,
 )
+from .sparse_simplex_complement import (
+    SparseSimplexComplementNet,
+    sparsemax,
+)
 
 __all__ = [
     "SpectralFoundation",
@@ -36,4 +40,6 @@ __all__ = [
     "gather_complement_candidates",
     "project_complement_vectors",
     "unflatten_spatial",
+    "SparseSimplexComplementNet",
+    "sparsemax",
 ]
