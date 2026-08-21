@@ -1,12 +1,12 @@
 """E24: LR-HSI cross-scale internal supervision for curvature adaptation.
 
 This experiment adapts only the E17-b curvature proposal predictor using the
-current test scene's *observed* LR-HSI.  No HR-HSI ground truth is used by the
+current test scene's *observed* LR-HSI. No HR-HSI ground truth is used by the
 optimizer or by checkpoint selection.
 
 For the real x4 task
     LR-HSI + HR-MSI -> HR-HSI,
-the observed LR-HSI is treated as a fully spectral pseudo-HR target.  A lower
+the observed LR-HSI is treated as a fully spectral pseudo-HR target. A lower
 resolution pseudo input is generated with the same HSI degradation operator,
 and the pseudo-HR MSI is generated with the same SRF:
     pseudo-GT      = observed LR-HSI
@@ -14,10 +14,10 @@ and the pseudo-HR MSI is generated with the same SRF:
     pseudo-HR-MSI  = R(pseudo-GT)
 
 The resulting task is spectrally supervised and geometrically isomorphic to the
-real fusion task.  Stage-1, Stage-2, P_tan and P_curv remain frozen/analytical;
+real fusion task. Stage-1, Stage-2, P_tan and P_curv remain frozen/analytical;
 only the existing E17-b proposal predictor is updated.
 
-The real HR-HSI GT is evaluated only as a diagnostic trajectory.  It is never
+The real HR-HSI GT is evaluated only as a diagnostic trajectory. It is never
 used in the adaptation loss and never used to select the saved checkpoint.
 """
 from __future__ import annotations
@@ -201,14 +201,7 @@ def build_model(cfg, info, device):
     model.eval()
     for parameter in model.local_model.parameters():
         parameter.requires_grad_(False)
-    return (
-        model,
-        local_epoch,
-        local_best,
-        curvature_epoch,
-        curvature_best,
-        metadata,
-    )
+    return model, local_epoch, local_best, curvature_epoch, curvature_best
 
 
 def _pseudo_task_from_observed_lr(
@@ -229,8 +222,7 @@ def _pseudo_task_from_observed_lr(
     if min(h // cfg.scale_ratio, w // cfg.scale_ratio) < 5:
         raise ValueError("Pseudo LLR-HSI is too small for the curvature construction")
 
-    # Use the exact dataset degradation routine used to create LR-HSI training
-    # inputs (Gaussian blur + cubic resize in the active runtime).
+    # Use the same dataset degradation routine used to create LR-HSI inputs.
     pseudo_gt_np = (
         observed_lr[0].detach().float().cpu().permute(1, 2, 0).contiguous().numpy()
     )
@@ -243,20 +235,13 @@ def _pseudo_task_from_observed_lr(
         .to(device=device, dtype=observed_lr.dtype)
     )
 
-    # Same SRF as the real task.  This is a pure observable projection of the
-    # already-observed LR-HSI and does not introduce hidden spectral content.
+    # Same SRF as the real task; no hidden spectrum is synthesized.
     pseudo_msi = model.local_model.geometry.hsi_to_msi(observed_lr).detach()
-    return {
-        "lr_hsi": pseudo_lr,
-        "hr_msi": pseudo_msi,
-        "gt": observed_lr,
-    }
+    return {"lr_hsi": pseudo_lr, "hr_msi": pseudo_msi, "gt": observed_lr}
 
 
 def _normalized_curvature_loss(
-    out: Dict[str, torch.Tensor],
-    target: torch.Tensor,
-    beta: float,
+    out: Dict[str, torch.Tensor], target: torch.Tensor, beta: float
 ) -> torch.Tensor:
     scale = out["coefficient_scale"].view(1, -1, 1, 1)
     return F.smooth_l1_loss(
@@ -278,17 +263,16 @@ def evaluate_task(
     pred = out["curvature_residual"]
     target = targets["curvature"]
 
-    pred_hsi = out["curvature_reconstructed_hsi"]
     oracle_hsi = model.local_model.foundation.decode(
-        out["corrected_coefficients"] + target,
-        basis=out["basis"],
+        out["corrected_coefficients"] + target, basis=out["basis"]
     )
     full_pcomp_hsi = model.local_model.foundation.decode(
-        out["corrected_coefficients"] + targets["pcomp"],
-        basis=out["basis"],
+        out["corrected_coefficients"] + targets["pcomp"], basis=out["basis"]
     )
     stage2_metric = calc_metrics(out["reconstructed_hsi"], batch["gt"], cfg.scale_ratio)
-    pred_metric = calc_metrics(pred_hsi, batch["gt"], cfg.scale_ratio)
+    pred_metric = calc_metrics(
+        out["curvature_reconstructed_hsi"], batch["gt"], cfg.scale_ratio
+    )
     oracle_metric = calc_metrics(oracle_hsi, batch["gt"], cfg.scale_ratio)
     pcomp_metric = calc_metrics(full_pcomp_hsi, batch["gt"], cfg.scale_ratio)
 
@@ -322,8 +306,7 @@ def evaluate_task(
     pixel_alpha = pixel_dot / pixel_pred_energy.clamp_min(1e-30)
     pixel_residual = pixel_alpha.to(pred.dtype) * pred
     pixel_hsi = model.local_model.foundation.decode(
-        out["corrected_coefficients"] + pixel_residual,
-        basis=out["basis"],
+        out["corrected_coefficients"] + pixel_residual, basis=out["basis"]
     )
     pixel_metric = calc_metrics(pixel_hsi, batch["gt"], cfg.scale_ratio)
 
@@ -344,9 +327,7 @@ def evaluate_task(
         "oracle_realization": float(realize),
         "saturation": float(
             (out["normalized_curvature_proposal"].abs() > 0.98)
-            .float()
-            .mean()
-            .item()
+            .float().mean().item()
         ),
     }
 
@@ -372,7 +353,7 @@ def _checkpoint_extra(cfg, source_checkpoint: str, pseudo_shape) -> Dict:
         "dataset": cfg.dataset,
         "curvature_rank": int(cfg.curvature_rank),
         "source_checkpoint": source_checkpoint,
-        "selection": "lowest pseudo-task curvature loss; real HR-HSI GT excluded",
+        "selection": "lowest evaluated pseudo-task curvature loss; real HR-HSI GT excluded",
         "pseudo_gt_source": "observed real LR-HSI",
         "pseudo_task_shape": list(pseudo_shape),
         "adapt_steps": int(cfg.adapt_steps),
@@ -393,14 +374,9 @@ def main():
         )
     real_batch = move_to_device(next(iter(test_loader)), device)
 
-    (
-        model,
-        local_epoch,
-        local_best,
-        curvature_epoch,
-        curvature_best,
-        metadata,
-    ) = build_model(cfg, info, device)
+    model, local_epoch, local_best, curvature_epoch, curvature_best = build_model(
+        cfg, info, device
+    )
     pseudo_batch = _pseudo_task_from_observed_lr(model, real_batch, cfg, device)
 
     print(
@@ -428,15 +404,9 @@ def main():
         weight_decay=cfg.adapt_weight_decay,
     )
 
-    out_dir = os.path.join(
-        cfg.output_root,
-        "internal_curvature_adaptation",
-        cfg.dataset,
-    )
+    out_dir = os.path.join(cfg.output_root, "internal_curvature_adaptation", cfg.dataset)
     ckpt_dir = os.path.join(
-        cfg.checkpoint_root,
-        "internal_curvature_adaptation",
-        cfg.dataset,
+        cfg.checkpoint_root, "internal_curvature_adaptation", cfg.dataset
     )
     ensure_dir(out_dir)
     ensure_dir(ckpt_dir)
@@ -446,15 +416,9 @@ def main():
     best_pseudo_step = 0
     best_state = copy.deepcopy(model.proposal_predictor.state_dict())
     trajectory = [
-        {
-            "step": 0,
-            "pseudo": pseudo_start,
-            "real_diagnostic": real_start,
-        }
+        {"step": 0, "pseudo": pseudo_start, "real_diagnostic": real_start}
     ]
 
-    # Save step-0 as a valid pseudo-selected state. This is overwritten only if
-    # the legal pseudo-task objective improves.
     save_checkpoint(
         model,
         optimizer=None,
@@ -462,9 +426,7 @@ def main():
         best_metric=-best_pseudo_loss,
         path=checkpoint_path,
         extra=_checkpoint_extra(
-            cfg,
-            cfg.curvature_checkpoint,
-            pseudo_batch["gt"].shape,
+            cfg, cfg.curvature_checkpoint, pseudo_batch["gt"].shape
         ),
     )
 
@@ -474,38 +436,17 @@ def main():
         out = model(pseudo_batch["lr_hsi"], pseudo_batch["hr_msi"])
         targets = build_targets(model, out, pseudo_batch["gt"])
         loss = _normalized_curvature_loss(
-            out,
-            targets["curvature"],
-            cfg.curvature_loss_beta,
+            out, targets["curvature"], cfg.curvature_loss_beta
         )
         loss.backward()
         if cfg.curvature_grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(
-                model.proposal_predictor.parameters(),
-                cfg.curvature_grad_clip,
+                model.proposal_predictor.parameters(), cfg.curvature_grad_clip
             )
         optimizer.step()
 
-        # Checkpoint selection is made only from the legal pseudo-task loss.
-        current_loss = float(loss.detach().item())
-        if current_loss < best_pseudo_loss:
-            best_pseudo_loss = current_loss
-            best_pseudo_step = int(step)
-            best_state = copy.deepcopy(model.proposal_predictor.state_dict())
-            save_checkpoint(
-                model,
-                optimizer=None,
-                epoch=step,
-                best_metric=-best_pseudo_loss,
-                path=checkpoint_path,
-                extra=_checkpoint_extra(
-                    cfg,
-                    cfg.curvature_checkpoint,
-                    pseudo_batch["gt"].shape,
-                ),
-            )
-
         if step % cfg.adapt_eval_interval == 0 or step == cfg.adapt_steps:
+            # This post-update pseudo loss is the only model-selection signal.
             pseudo_stat = evaluate_task(model, pseudo_batch, cfg)
             real_stat = evaluate_task(model, real_batch, cfg)
             _print_eval("Pseudo", step, pseudo_stat)
@@ -518,8 +459,22 @@ def main():
                 }
             )
 
-    # Restore the state chosen *only* by pseudo-task loss and report its real
-    # diagnostic result. Real GT has not influenced this choice.
+            if pseudo_stat["loss"] < best_pseudo_loss:
+                best_pseudo_loss = float(pseudo_stat["loss"])
+                best_pseudo_step = int(step)
+                best_state = copy.deepcopy(model.proposal_predictor.state_dict())
+                save_checkpoint(
+                    model,
+                    optimizer=None,
+                    epoch=step,
+                    best_metric=-best_pseudo_loss,
+                    path=checkpoint_path,
+                    extra=_checkpoint_extra(
+                        cfg, cfg.curvature_checkpoint, pseudo_batch["gt"].shape
+                    ),
+                )
+
+    # Restore the state selected only by the legal pseudo-task loss.
     model.proposal_predictor.load_state_dict(best_state, strict=True)
     pseudo_selected = evaluate_task(model, pseudo_batch, cfg)
     real_selected = evaluate_task(model, real_batch, cfg)
@@ -562,14 +517,12 @@ def main():
             "steps": int(cfg.adapt_steps),
             "lr": float(cfg.adapt_lr),
             "weight_decay": float(cfg.adapt_weight_decay),
+            "eval_interval": int(cfg.adapt_eval_interval),
             "best_pseudo_step": int(best_pseudo_step),
             "best_pseudo_loss": float(best_pseudo_loss),
             "checkpoint": checkpoint_path,
         },
-        "start": {
-            "pseudo": pseudo_start,
-            "real_diagnostic": real_start,
-        },
+        "start": {"pseudo": pseudo_start, "real_diagnostic": real_start},
         "pseudo_selected": {
             "pseudo": pseudo_selected,
             "real_diagnostic": real_selected,
