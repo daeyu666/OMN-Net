@@ -266,7 +266,6 @@ def _spherical_kmeans(x: np.ndarray, k: int, iterations: int):
         raise ValueError("not enough samples for requested state_clusters")
     n = x.shape[0]
 
-    # Deterministic farthest-first initialization.
     global_mean = x.mean(axis=0)
     global_mean /= max(np.linalg.norm(global_mean), 1e-12)
     first = int(np.argmin(x @ global_mean))
@@ -292,7 +291,6 @@ def _spherical_kmeans(x: np.ndarray, k: int, iterations: int):
         for cluster in range(k):
             members = x[labels == cluster]
             if members.shape[0] == 0:
-                # Re-seed with the globally least represented sample.
                 sims = x @ centers.T
                 best_sim = sims.max(axis=1)
                 idx = int(np.argmin(best_sim))
@@ -451,7 +449,6 @@ def main():
     real_batch = _batchify(test_set[0], device)
     global_baseline = _evaluate(model, real_batch, cfg)
 
-    # Descriptor extraction is entirely GT-free.
     train_descs = []
     with torch.no_grad():
         for index in range(len(train_set)):
@@ -509,7 +506,6 @@ def main():
     expert_records = []
     routed_result = None
 
-    # Specialists are trained sequentially to avoid holding K models in GPU memory.
     for cluster, members in enumerate(cluster_members):
         load_checkpoint(
             model,
@@ -561,8 +557,6 @@ def main():
         if cluster == routed_cluster:
             routed_result = test_stat
 
-    # Fair additional-training control: same number of optimizer updates as one expert,
-    # but no state partitioning.
     load_checkpoint(
         model,
         cfg.curvature_checkpoint,
@@ -616,7 +610,7 @@ def main():
         f"Baseline={global_baseline['pred_psnr']:.4f} | "
         f"GlobalContinue={global_continue['pred_psnr']:.4f} "
         f"({global_continue['pred_psnr']-global_baseline['pred_psnr']:+.4f}) | "
-        f"RoutedExpert{k if False else ''}={routed_result['pred_psnr']:.4f} "
+        f"RoutedExpert={routed_result['pred_psnr']:.4f} "
         f"cluster={routed_cluster} "
         f"({routed_result['pred_psnr']-global_baseline['pred_psnr']:+.4f}) | "
         f"OracleExpert={oracle_result['pred_psnr']:.4f} cluster={oracle_cluster} "
