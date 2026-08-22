@@ -12,6 +12,10 @@ from .local_null_manifold import (
     LocalNullManifoldNet,
     build_local_tangent_field,
 )
+from .curvature_latent_field import (
+    CurvatureLatentFieldNet,
+    CurvatureLatentPredictor,
+)
 from .nonlocal_complement import (
     ObservableKeyedComplementMemory,
     flatten_spatial,
@@ -34,6 +38,8 @@ __all__ = [
     "project_coefficients",
     "LocalNullManifoldNet",
     "build_local_tangent_field",
+    "CurvatureLatentFieldNet",
+    "CurvatureLatentPredictor",
     "ObservableKeyedComplementMemory",
     "flatten_spatial",
     "flatten_tangent",
